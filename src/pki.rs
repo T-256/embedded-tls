@@ -33,7 +33,6 @@ use crate::extensions::extension_data::signature_algorithms::SignatureScheme;
 use crate::handshake::{
     certificate::{
         Certificate as OwnedCertificate, CertificateEntryRef, CertificateRef as ServerCertificate,
-        MAX_CERTIFICATE_ENTRIES,
     },
     certificate_verify::CertificateVerifyRef,
 };
@@ -48,6 +47,12 @@ pub struct CertificateNames {
     pub san_dns_names: heapless::Vec<heapless::String<HOSTNAME_MAXLEN>, MAX_SAN_DNS_NAMES>,
 }
 
+/// Verifies that the trusted root signed the server's certificate directly, with code written
+/// for this crate on `RustCrypto`. It checks no chain, and ignores the other certificates the
+/// server sends.
+///
+/// The verifier keeps a copy of the whole Certificate message until it checks the
+/// `CertificateVerify` signature, so `CERT_SIZE` must hold every certificate the server sends.
 pub struct CertVerifier<'a, CipherSuite, Clock, const CERT_SIZE: usize>
 where
     Clock: TlsClock,
@@ -105,10 +110,7 @@ where
         // (RFC9846, Section 4.5.1):
         //
         // "The sender's certificate MUST come in the first CertificateEntry in the list."
-        let (end_entity, chain) = cert
-            .entries
-            .split_first()
-            .ok_or(TlsError::InvalidCertificate)?;
+        let end_entity = cert.entries.first().ok_or(TlsError::InvalidCertificate)?;
 
         // (RFC9846, Section 4.5.1)
         //
@@ -120,73 +122,12 @@ where
             CertificateEntryRef::RawPublicKey(_) => return Err(TlsError::DecodeError),
         };
 
-        let mut candidates = heapless::Vec::<_, MAX_CERTIFICATE_ENTRIES>::new();
-        for entry in chain {
-            // See above, certificates should be X.509
-            let CertificateEntryRef::X509(der) = entry else {
-                continue;
-            };
-            let candidate = match ParsedCertificate::from_der(der) {
-                Ok(candidate) => candidate,
-                Err(err) => {
-                    warn!("Invalid certificate {:?}", err);
-                    // Ignore invalid certificates
-                    continue;
-                }
-            };
-
-            // Validate certificate time if we have a clock
-            match now {
-                Some(time) => {
-                    if !is_valid_at(&candidate.decoded, time) {
-                        warn!("Certificate is not valid at time {}", time);
-                        continue;
-                    }
-                }
-                None => warn!("No time provided, could not check certificate's validity"),
-            }
-
-            candidates
-                .push(candidate)
-                .map_err(|_| TlsError::InsufficientSpace)?;
-        }
-
-        // The CA is the first trusted cert.
-        // Every certificate in the chain becomes trusted if it can be certified by any already
-        // trusted certificate.
-        let mut trusted_certs = heapless::Vec::<_, MAX_CERTIFICATE_ENTRIES>::new();
-        trusted_certs
-            .push(ca)
-            .map_err(|_| TlsError::InsufficientSpace)?;
-
-        // (RFC9846, Section 4.5.1):
-        //
-        // "implementations SHOULD be prepared to handle potentially extraneous
+        // The verifier does not check that a certificate may act as a CA, so it trusts only the
+        // configured CA, and ignores the other certificates the server sends. (RFC9846, Section
+        // 4.5.1): "implementations SHOULD be prepared to handle potentially extraneous
         // certificates and arbitrary orderings from any TLS version"
-        loop {
-            let trusted_before = trusted_certs.len();
-
-            let mut idx = 0;
-            while idx < candidates.len() {
-                match certified_by_any(&trusted_certs, &candidates[idx]) {
-                    CertificateVerification::Certifies => {
-                        let certificate = candidates.swap_remove(idx);
-                        trusted_certs
-                            .push(certificate)
-                            .map_err(|_| TlsError::InsufficientSpace)?;
-                    }
-                    // A failure to validate an intermediate certificate can be ignored
-                    // (see note above).
-                    CertificateVerification::DoesNotCertify => idx += 1,
-                }
-            }
-
-            if trusted_certs.len() == trusted_before {
-                break;
-            }
-        }
-
-        // Now that we know what certificates we trust, validate that the end-entity certificate:
+        //
+        // Validate that the end-entity certificate:
         // 1. Is valid
         match now {
             Some(time) => {
@@ -198,11 +139,11 @@ where
             None => warn!("No time provided, could not check end-entity certificate's validity"),
         }
 
-        // 2. Is certified by any of the trusted certificates
-        match certified_by_any(&trusted_certs, &end_entity) {
-            CertificateVerification::Certifies => (),
-            CertificateVerification::DoesNotCertify => {
-                error!("No trusted certificate certifies the end-entity certificate");
+        // 2. Is certified by the CA
+        match verify_certificate(&ca, &end_entity) {
+            Ok(CertificateVerification::Certifies) => (),
+            Ok(CertificateVerification::DoesNotCertify) | Err(_) => {
+                error!("The CA does not certify the end-entity certificate");
                 return Err(TlsError::InvalidCertificate);
             }
         }
@@ -288,7 +229,8 @@ fn verify_signature(
                 signature::Verifier,
             };
 
-            let der_pubkey = RsaPublicKey::from_pkcs1_der(public_key).unwrap();
+            let der_pubkey =
+                RsaPublicKey::from_pkcs1_der(public_key).map_err(|_| TlsError::DecodeError)?;
             let verifying_key = VerifyingKey::<Sha256>::from(der_pubkey);
 
             let signature =
@@ -403,31 +345,6 @@ enum CertificateVerification {
 fn is_valid_at(certificate: &DecodedCertificate, now: u64) -> bool {
     let validity = &certificate.tbs_certificate.validity;
     get_cert_time(&validity.not_before) <= now && now <= get_cert_time(&validity.not_after)
-}
-
-/// Checks whether any of the `trusted_certs` directly certifies `certificate`.
-fn certified_by_any(
-    trusted_certs: &[ParsedCertificate<'_>],
-    certificate: &ParsedCertificate<'_>,
-) -> CertificateVerification {
-    // (RFC9846, Section 4.5.1)
-    //
-    // "Each following certificate SHOULD directly certify the one immediately preceding it."
-    //
-    // .. so we start with the most recently added certificate :)
-    for trusted in trusted_certs.iter().rev() {
-        match verify_certificate(trusted, certificate) {
-            Ok(CertificateVerification::Certifies) => {
-                return CertificateVerification::Certifies;
-            }
-            Ok(CertificateVerification::DoesNotCertify) => {}
-            Err(err) => {
-                debug!("Failed to verify certificate: {}", err);
-            }
-        }
-    }
-
-    CertificateVerification::DoesNotCertify
 }
 
 /// Checks that a `verifier` directly certifies a `certificate`.
@@ -717,33 +634,62 @@ mod cert_verifier_tests {
         verifier.verify_certificate(&embassy_crypto::Sha256::new(), cert_chain)
     }
 
+    // The server sends [server_cert]. The configured CA signed server_cert.
+    #[test]
+    fn server_cert_signed_by_the_ca_is_accepted() {
+        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/server-cert.pem"));
+        let ca = pem_parser::pem_to_der(include_str!("../tests/data/ca-cert.pem"));
+
+        let result = verify(&ca, &[&server_cert]);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
     // The server sends [server_cert, intermediate].
     //
     // - server_cert is signed by intermediate.
     // - intermediate is signed by the configured CA.
     //
-    // This is a happy-path test, that we can validate a valid cert chain.
+    // The verifier does not check that a certificate may act as a CA, so it trusts no
+    // intermediate, and only a certificate the CA signed directly passes.
     #[test]
-    fn server_cert_and_intermediate_are_accepted() {
+    fn server_cert_and_intermediate_are_rejected() {
         let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/im-server-cert.pem"));
         let intermediate = pem_parser::pem_to_der(include_str!("../tests/data/im-cert.pem"));
         let ca = pem_parser::pem_to_der(include_str!("../tests/data/ca-cert.pem"));
 
         let result = verify(&ca, &[&server_cert, &intermediate]);
-        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(matches!(result, Err(TlsError::InvalidCertificate)));
+    }
+
+    // The server sends [server_cert, client_cert].
+    //
+    // - server_cert is signed by client_cert.
+    // - client_cert is signed by the configured CA, and is not a CA.
+    //
+    // Anyone holding the key of a certificate the CA signed could otherwise issue a certificate
+    // for any server. client_cert has the CA's subject name, so server_cert's issuer names the
+    // CA and only the signature check can refuse it. Keep the names equal if the certificates
+    // are regenerated.
+    #[test]
+    fn server_cert_signed_by_a_non_ca_is_rejected() {
+        let server_cert =
+            pem_parser::pem_to_der(include_str!("../tests/data/forged-server-cert.pem"));
+        let client_cert = pem_parser::pem_to_der(include_str!("../tests/data/client-cert.pem"));
+        let ca = pem_parser::pem_to_der(include_str!("../tests/data/ca-cert.pem"));
+
+        let result = verify(&ca, &[&server_cert, &client_cert]);
+        assert!(matches!(result, Err(TlsError::InvalidCertificate)));
     }
 
     // The server sends [server_cert, intermediate, cross-signed CA].
     //
-    // - server_cert is signed by intermediate.
-    // - intermediate is signed by the configured CA.
+    // - server_cert is signed by the configured CA.
+    // - intermediate and the cross-signed CA are not needed.
     //
-    // At the end of the operation, the list of trusted certs is [ca, intermediate].
-    //
-    // This test ensures that the cross-signed CA is safely ignored by the verifier.
+    // This test ensures that the extra certificates are safely ignored by the verifier.
     #[test]
     fn extra_cross_signed_ca_is_ignored() {
-        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/im-server-cert.pem"));
+        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/server-cert.pem"));
         let intermediate = pem_parser::pem_to_der(include_str!("../tests/data/im-cert.pem"));
         let cross_signed_ca =
             pem_parser::pem_to_der(include_str!("../tests/data/ca-cross-signed-cert.pem"));
@@ -755,17 +701,13 @@ mod cert_verifier_tests {
 
     // The server sends [server_cert, other_root, client_cert, intermediate].
     //
-    // - server_cert is signed by intermediate.
-    // - intermediate is signed by the configured CA.
-    // - other_root and client_cert are what RFC 9846 calls "extraneous", not needed to reach the CA.
-    //
-    // At the end of the operation, the list of trusted certs is
-    // [ca, client_cert, intermediate].
+    // - server_cert is signed by the configured CA.
+    // - other_root, client_cert and intermediate are what RFC 9846 calls "extraneous".
     //
     // This test ensures that extraneous certificates, in any order, do not break cert verification.
     #[test]
     fn extraneous_intermediates_are_ignored() {
-        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/im-server-cert.pem"));
+        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/server-cert.pem"));
         let intermediate = pem_parser::pem_to_der(include_str!("../tests/data/im-cert.pem"));
         let other_root = pem_parser::pem_to_der(include_str!("../tests/data/other-root-cert.pem"));
         let client_cert = pem_parser::pem_to_der(include_str!("../tests/data/client-cert.pem"));
@@ -778,21 +720,19 @@ mod cert_verifier_tests {
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
-    // The server sends [server_cert, garbage, intermediate].
+    // The server sends [server_cert, garbage].
     //
-    // - server_cert is signed by intermediate.
+    // - server_cert is signed by the configured CA.
     // - garbage is invalid DER and cannot be decoded at all.
-    // - intermediate is signed by the configured CA.
     //
     // This test ensures that a cert we cannot parse is ignored, for robustness.
     #[test]
     fn unparsable_certificate_is_ignored() {
-        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/im-server-cert.pem"));
-        let intermediate = pem_parser::pem_to_der(include_str!("../tests/data/im-cert.pem"));
+        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/server-cert.pem"));
         let garbage = b"this is not a certificate";
         let ca = pem_parser::pem_to_der(include_str!("../tests/data/ca-cert.pem"));
 
-        let result = verify(&ca, &[&server_cert, garbage, &intermediate]);
+        let result = verify(&ca, &[&server_cert, garbage]);
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
@@ -808,6 +748,29 @@ mod cert_verifier_tests {
 
         let result = verify(&other_ca, &[&server_cert, &intermediate]);
         assert!(matches!(result, Err(TlsError::InvalidCertificate)));
+    }
+
+    // The scheme comes from the peer's CertificateVerify and the key from the server's
+    // certificate, so a peer can pair an RSA-PSS scheme with an ECDSA key.
+    #[cfg(feature = "rsa")]
+    #[test]
+    fn certificate_verify_claiming_rsa_pss_for_an_ecdsa_key_is_rejected() {
+        let server_cert = pem_parser::pem_to_der(include_str!("../tests/data/server-cert.pem"));
+        let mut chain = ServerCertificate::with_context(&[]);
+        chain.add(CertificateEntryRef::X509(&server_cert)).unwrap();
+
+        for scheme in [
+            SignatureScheme::RsaPssRsaeSha256,
+            SignatureScheme::RsaPssRsaeSha384,
+            SignatureScheme::RsaPssRsaeSha512,
+        ] {
+            let verify = CertificateVerifyRef {
+                signature_scheme: scheme,
+                signature: &[0; 256],
+            };
+            let result = verify_signature(b"message", &chain, &verify);
+            assert!(matches!(result, Err(TlsError::DecodeError)), "{scheme:?}");
+        }
     }
 }
 

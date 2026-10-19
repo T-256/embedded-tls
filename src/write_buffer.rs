@@ -7,22 +7,35 @@ use crate::{
     record::{ClientRecord, ClientRecordHeader},
 };
 
+/// Holds one record. While a record is open, plaintext is appended to it. Once sealed, the
+/// buffer keeps the encrypted record until the transport has consumed all of it, so a `flush`
+/// that is cancelled or fails part way through resumes where it stopped.
 pub struct WriteBuffer<'a> {
     buffer: &'a mut [u8],
     pos: usize,
+    /// The bytes of a sealed record that the transport has already consumed.
+    sent: usize,
     current_header: Option<ClientRecordHeader>,
+    /// Set when the transport consumes record bytes, cleared when a transport flush completes.
+    /// Under `FlushPolicy::Relaxed` nothing clears it, so the first `flush` after a switch to
+    /// `Strict` flushes the transport. The handshake and `close` do not set it. They flush the
+    /// transport themselves.
+    transport_unflushed: bool,
 }
 
 pub(crate) struct WriteBufferBorrow<'a> {
     buffer: &'a [u8],
     pos: &'a usize,
+    sent: &'a usize,
     current_header: &'a Option<ClientRecordHeader>,
 }
 
 pub(crate) struct WriteBufferBorrowMut<'a> {
     buffer: &'a mut [u8],
     pos: &'a mut usize,
+    sent: &'a mut usize,
     current_header: &'a mut Option<ClientRecordHeader>,
+    transport_unflushed: &'a mut bool,
 }
 
 impl<'a> WriteBuffer<'a> {
@@ -34,7 +47,9 @@ impl<'a> WriteBuffer<'a> {
         Self {
             buffer,
             pos: 0,
+            sent: 0,
             current_header: None,
+            transport_unflushed: false,
         }
     }
 
@@ -42,14 +57,26 @@ impl<'a> WriteBuffer<'a> {
         WriteBufferBorrowMut {
             buffer: self.buffer,
             pos: &mut self.pos,
+            sent: &mut self.sent,
             current_header: &mut self.current_header,
+            transport_unflushed: &mut self.transport_unflushed,
         }
+    }
+
+    pub(crate) fn transport_unflushed(&self) -> bool {
+        self.transport_unflushed
+    }
+
+    /// A transport flush completed.
+    pub(crate) fn transport_flushed(&mut self) {
+        self.transport_unflushed = false;
     }
 
     pub(crate) fn reborrow(&self) -> WriteBufferBorrow<'_> {
         WriteBufferBorrow {
             buffer: self.buffer,
             pos: &self.pos,
+            sent: &self.sent,
             current_header: &self.current_header,
         }
     }
@@ -74,21 +101,6 @@ impl<'a> WriteBuffer<'a> {
         self.reborrow_mut().start_record(header)
     }
 
-    pub(crate) fn close_record<CipherSuite>(
-        &mut self,
-        write_key_schedule: &mut WriteKeySchedule<CipherSuite>,
-    ) -> Result<&[u8], TlsError>
-    where
-        CipherSuite: TlsCipherSuite,
-    {
-        close_record(
-            self.buffer,
-            &mut self.pos,
-            &mut self.current_header,
-            write_key_schedule,
-        )
-    }
-
     pub fn write_record<CipherSuite>(
         &mut self,
         record: &ClientRecord<CipherSuite>,
@@ -109,7 +121,7 @@ impl<'a> WriteBuffer<'a> {
     }
 }
 
-impl WriteBufferBorrow<'_> {
+impl<'a> WriteBufferBorrow<'a> {
     fn max_block_size(&self) -> usize {
         self.buffer.len() - TLS_RECORD_OVERHEAD
     }
@@ -133,6 +145,20 @@ impl WriteBufferBorrow<'_> {
     pub fn contains(&self, header: ClientRecordHeader) -> bool {
         self.current_header.as_ref() == Some(&header)
     }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.current_header.is_some()
+    }
+
+    /// The bytes of the sealed record that the transport has not yet consumed. Empty while a
+    /// record is open.
+    pub(crate) fn unsent(&self) -> &'a [u8] {
+        if self.is_open() {
+            &[]
+        } else {
+            &self.buffer[*self.sent..*self.pos]
+        }
+    }
 }
 
 impl WriteBufferBorrowMut<'_> {
@@ -140,6 +166,7 @@ impl WriteBufferBorrowMut<'_> {
         WriteBufferBorrow {
             buffer: self.buffer,
             pos: self.pos,
+            sent: self.sent,
             current_header: self.current_header,
         }
     }
@@ -169,19 +196,47 @@ impl WriteBufferBorrowMut<'_> {
         start_record(self.buffer, self.pos, self.current_header, header)
     }
 
-    pub fn close_record<CipherSuite>(
+    pub(crate) fn seal_record<CipherSuite>(
         &mut self,
         write_key_schedule: &mut WriteKeySchedule<CipherSuite>,
-    ) -> Result<&[u8], TlsError>
+    ) -> Result<(), TlsError>
     where
         CipherSuite: TlsCipherSuite,
     {
-        close_record(
+        seal_record(
             self.buffer,
             self.pos,
             self.current_header,
             write_key_schedule,
         )
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.reborrow().is_open()
+    }
+
+    pub(crate) fn unsent(&self) -> &[u8] {
+        self.reborrow().unsent()
+    }
+
+    /// Records that the transport consumed `count` bytes of the sealed record. The buffer is
+    /// empty again once it has consumed all of them.
+    pub(crate) fn mark_sent(&mut self, count: usize) {
+        *self.transport_unflushed = true;
+        *self.sent += count;
+        if *self.sent >= *self.pos {
+            *self.pos = 0;
+            *self.sent = 0;
+        }
+    }
+
+    pub(crate) fn transport_unflushed(&self) -> bool {
+        *self.transport_unflushed
+    }
+
+    /// A transport flush completed.
+    pub(crate) fn transport_flushed(&mut self) {
+        *self.transport_unflushed = false;
     }
 }
 
@@ -219,12 +274,13 @@ fn with_buffer(
     }
 }
 
-fn close_record<'a, CipherSuite>(
-    buffer: &'a mut [u8],
+/// Encrypts the open record in place and leaves it in the buffer, `*pos` bytes long.
+fn seal_record<CipherSuite>(
+    buffer: &mut [u8],
     pos: &mut usize,
     current_header: &mut Option<ClientRecordHeader>,
     write_key_schedule: &mut WriteKeySchedule<CipherSuite>,
-) -> Result<&'a [u8], TlsError>
+) -> Result<(), TlsError>
 where
     CipherSuite: TlsCipherSuite,
 {
@@ -248,12 +304,21 @@ where
     buffer[3] = upper;
     buffer[4] = lower;
 
-    let slice = &buffer[..*pos];
+    Ok(())
+}
 
-    *pos = 0;
-    *current_header = None;
-
-    Ok(slice)
+fn close_record<'a, CipherSuite>(
+    buffer: &'a mut [u8],
+    pos: &mut usize,
+    current_header: &mut Option<ClientRecordHeader>,
+    write_key_schedule: &mut WriteKeySchedule<CipherSuite>,
+) -> Result<&'a [u8], TlsError>
+where
+    CipherSuite: TlsCipherSuite,
+{
+    seal_record(buffer, pos, current_header, write_key_schedule)?;
+    let len = core::mem::take(pos);
+    Ok(&buffer[..len])
 }
 
 fn write_record<'a, CipherSuite>(

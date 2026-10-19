@@ -5,17 +5,22 @@ openssl req -new -x509 -sha256 -key ca-key.pem -days 10000 -out ca-cert.pem
 # Create private key, certificate signing request (CSR) and certificate for intermediate CA
 openssl ecparam -name prime256v1 -genkey -noout -out im-key.pem
 openssl req -new -sha256 -key im-key.pem -out im.csr
-openssl x509 -req -in im.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out im-cert.pem -days 10000 -sha256
+openssl x509 -req -in im.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out im-cert.pem -days 10000 -sha256 -extfile <(printf 'basicConstraints = critical, CA:TRUE\n')
 
 # Create private key, certificate signing request (CSR) and certificate for client
 openssl ecparam -name prime256v1 -genkey -noout -out client-key.pem
 openssl req -new -sha256 -key client-key.pem -out client.csr
 openssl x509 -req -in client.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out client-cert.pem -days 10000 -sha256
 
+# Create a server certificate signed by the client certificate, which is not a CA
+openssl ecparam -name prime256v1 -genkey -noout -out forged-server-key.pem
+openssl req -new -sha256 -key forged-server-key.pem -subj "/CN=Forged Server" -out forged-server.csr
+openssl x509 -req -in forged-server.csr -CA client-cert.pem -CAkey client-key.pem -CAcreateserial -out forged-server-cert.pem -days 10000 -sha256 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+
 # Create private key, certificate signing request (CSR) and certificate for server
 openssl ecparam -name prime256v1 -genkey -noout -out server-key.pem
 openssl req -new -sha256 -key server-key.pem -out server.csr
-openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out server-cert.pem -days 10000 -sha256
+openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out server-cert.pem -days 10000 -sha256 -extfile <(printf 'subjectAltName = DNS:localhost\n')
 
 # Create private key, certificate signing request (CSR) and certificate from intermediate CA for server with hostname
 openssl ecparam -name prime256v1 -genkey -noout -out im-server-key.pem
@@ -34,20 +39,47 @@ openssl x509 -req -in ca-cross-signed.csr -CA other-root-cert.pem -CAkey other-r
 rm -f other-root-cert.srl
 
 # Create Ed25519 CA private key and certificate
-#openssl genpkey -algorithm ed25519 -out ed-ca-key.pem
-#openssl req -new -x509 -sha256 -key ed-ca-key.pem -days 10000 -out ed-ca-cert.pem
+openssl genpkey -algorithm ed25519 -out ed-ca-key.pem
+openssl req -new -x509 -key ed-ca-key.pem -days 10000 -out ed-ca-cert.pem -subj "/CN=Ed25519 Test CA"
 
 # Create Ed25519 private key, certificate signing request (CSR) and certificate for server
-#openssl genpkey -algorithm ed25519 -out ed-server-key.pem
-#openssl req -new -key ed-server-key.pem -out ed-server.csr
-#openssl x509 -req -in ed-server.csr -CA ed-ca-cert.pem -CAkey ed-ca-key.pem -CAcreateserial -out ed-server.pem -days 10000
+openssl genpkey -algorithm ed25519 -out ed-server-key.pem
+openssl req -new -key ed-server-key.pem -out ed-server.csr -subj "/CN=localhost"
+openssl x509 -req -in ed-server.csr -CA ed-ca-cert.pem -CAkey ed-ca-key.pem -CAcreateserial -out ed-server-cert.pem -days 10000 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+
+# Create a P-384 CA, and certificates for server-key.pem that it signs with SHA-384 and with SHA-256
+openssl ecparam -name secp384r1 -genkey -noout -out p384-ca-key.pem
+openssl req -new -x509 -sha384 -key p384-ca-key.pem -days 10000 -out p384-ca-cert.pem -subj "/CN=P-384 Test CA"
+openssl x509 -req -in server.csr -CA p384-ca-cert.pem -CAkey p384-ca-key.pem -CAcreateserial -out p384-server-cert.pem -days 10000 -sha384 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+openssl x509 -req -in server.csr -CA p384-ca-cert.pem -CAkey p384-ca-key.pem -CAcreateserial -out p384-sha256-server-cert.pem -days 10000 -sha256 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+
+# Create a P-384 server key, and a certificate for it from the P-384 CA
+openssl ecparam -name secp384r1 -genkey -noout -out p384-key-server-key.pem
+openssl req -new -sha384 -key p384-key-server-key.pem -out p384-key-server.csr -subj "/CN=localhost"
+openssl x509 -req -in p384-key-server.csr -CA p384-ca-cert.pem -CAkey p384-ca-key.pem -CAcreateserial -out p384-key-server-cert.pem -days 10000 -sha384 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+
+# Create a certificate for server-key.pem that the P-256 CA signs with SHA-384
+openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out sha384-server-cert.pem -days 10000 -sha384 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+
+# Create certificates for server-key.pem with fixed dates: one that has expired, and one not yet valid
+openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out expired-server-cert.pem -not_before 20200101000000Z -not_after 20210101000000Z -sha256 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out future-server-cert.pem -not_before 20900101000000Z -not_after 20910101000000Z -sha256 -extfile <(printf 'subjectAltName = DNS:localhost\n')
+
+# Create an intermediate that expired in 2021, and a server certificate from it that is valid only
+# from 2022, so no time falls within both
+openssl x509 -req -in im.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out expired-im-cert.pem -not_before 20200101000000Z -not_after 20210101000000Z -sha256 -extfile <(printf 'basicConstraints = critical, CA:TRUE\n')
+openssl x509 -req -in im-server.csr -CA expired-im-cert.pem -CAkey im-key.pem -CAcreateserial -out late-im-server-cert.pem -not_before 20220101000000Z -not_after 20230101000000Z -sha256 -copy_extensions copy
 
 # Create RSA CA private key and certificate
 openssl req -x509 -newkey rsa:2048 -keyout rsa-ca-key.pem -nodes -out rsa-ca-cert.pem -sha256 -days 10000
 
 # Create RSA private key, certificate signing request (CSR) and certificate for server
 openssl req -newkey rsa:2048 -keyout rsa-server-key.pem -nodes -out rsa-server-cert.csr -sha256 -subj "/CN=localhost"
-openssl x509 -req -CA rsa-ca-cert.pem -CAkey rsa-ca-key.pem -in rsa-server-cert.csr -out rsa-server-cert.pem -days 10000 -CAcreateserial
+openssl x509 -req -CA rsa-ca-cert.pem -CAkey rsa-ca-key.pem -in rsa-server-cert.csr -out rsa-server-cert.pem -days 10000 -CAcreateserial -extfile <(printf 'subjectAltName = DNS:localhost\n')
+
+# Create a 1024-bit RSA key and a certificate for it, which a verifier must refuse
+openssl req -newkey rsa:1024 -keyout rsa1024-server-key.pem -nodes -out rsa1024-server-cert.csr -sha256 -subj "/CN=localhost"
+openssl x509 -req -CA rsa-ca-cert.pem -CAkey rsa-ca-key.pem -in rsa1024-server-cert.csr -out rsa1024-server-cert.pem -days 10000 -CAcreateserial -extfile <(printf 'subjectAltName = DNS:localhost\n')
 
 # Create RSA private key, certificate signing request (CSR) and certificate for client
 openssl req -newkey rsa:2048 -keyout rsa-client-key.pem -nodes -out rsa-client-cert.csr -sha256

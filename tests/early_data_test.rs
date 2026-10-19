@@ -1,3 +1,6 @@
+// The test server's certificate is P-256, which the client offers only with `p256`.
+#![cfg(feature = "p256")]
+
 use embedded_io::{Read, Write};
 use embedded_io_adapters::std::FromStd;
 use std::net::SocketAddr;
@@ -71,7 +74,7 @@ fn early_data_ignored() {
         &mut write_record_buffer,
     );
 
-    tls.open(TlsContext::new(&config, NoVerify))
+    tls.open(TlsContext::new(&config, InsecureNoVerify))
         .expect("error establishing TLS connection");
 
     tls.write_all(b"ping").expect("Failed to write data");

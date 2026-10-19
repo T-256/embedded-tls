@@ -85,13 +85,22 @@ where
 
 /// A verifier that accepts any server certificate without checking it.
 ///
-/// Only use this when the server is authenticated by other means, such as a pre-shared key,
-/// or for testing.
+/// With certificates, the connection is encrypted but the server is not authenticated, so an
+/// attacker in the path can stand in for it. Only use this when the server is authenticated by
+/// other means, such as a pre-shared key, or for testing.
 #[derive(Debug, Default, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct NoVerify;
+pub struct InsecureNoVerify;
 
-impl<CipherSuite> TlsVerifier<CipherSuite> for NoVerify
+#[deprecated(note = "renamed to InsecureNoVerify")]
+pub type NoVerify = InsecureNoVerify;
+
+// A type alias does not name the unit value, so callers that pass `NoVerify` need this too.
+#[deprecated(note = "renamed to InsecureNoVerify")]
+#[allow(non_upper_case_globals)]
+pub const NoVerify: InsecureNoVerify = InsecureNoVerify;
+
+impl<CipherSuite> TlsVerifier<CipherSuite> for InsecureNoVerify
 where
     CipherSuite: TlsCipherSuite,
 {
@@ -124,13 +133,29 @@ pub struct TlsConfig<'a> {
     pub(crate) max_fragment_length: Option<MaxFragmentLength>,
 }
 
+/// The time for certificate dates, given as a verifier's `Clock` parameter.
+///
+/// Implement it for a type that reads the device's clock. `std::time::SystemTime` implements it
+/// with the `std` feature, and [`InsecureIgnoreDates`] is for a device without the time.
 pub trait TlsClock {
+    /// Returns the time in seconds since the Unix epoch.
+    ///
+    /// Returns `None` on a device without the time. The verifiers then do not check certificate
+    /// dates. A clock that returns `None` until it syncs accepts certificates whatever their dates
+    /// until then. A device that must check dates waits for the time before it connects.
     fn now() -> Option<u64>;
 }
 
-pub struct NoClock;
+#[deprecated(note = "renamed to InsecureIgnoreDates")]
+pub type NoClock = InsecureIgnoreDates;
 
-impl TlsClock for NoClock {
+/// A clock for a device without the time. Certificates pass whatever their dates.
+///
+/// The `webpki` verifier uses the latest `notBefore` in the chain as the time. A chain whose
+/// validity periods do not overlap still fails. Every other check still runs.
+pub struct InsecureIgnoreDates;
+
+impl TlsClock for InsecureIgnoreDates {
     fn now() -> Option<u64> {
         None
     }
@@ -332,7 +357,7 @@ impl<'a, Verifier> TlsContext<'a, Verifier> {
     /// Create a new context with a given config, using `verifier` to verify the server
     /// certificate and its signature.
     ///
-    /// Pass [`NoVerify`] to skip certificate verification entirely. Only do that when the
+    /// Pass [`InsecureNoVerify`] to skip certificate verification entirely. Only do that when the
     /// server is authenticated by other means, such as a pre-shared key, or for testing.
     #[must_use]
     pub fn new(config: &'a TlsConfig<'a>, verifier: Verifier) -> Self {
@@ -354,6 +379,12 @@ impl<'a, Verifier> TlsContext<'a, Verifier> {
 }
 
 impl<'a> TlsConfig<'a> {
+    /// A configuration whose `signature_algorithms` offer the schemes of the enabled `p256`,
+    /// `p384`, `ed25519` and `rsa` features, the ones the verifiers can check.
+    ///
+    /// Without any of those features the client offers no scheme, so it can only authenticate
+    /// the server with a pre-shared key, set with [`TlsConfig::with_psk`]. Opening a connection
+    /// without one fails with [`TlsError::MissingPsk`](crate::TlsError::MissingPsk).
     pub fn new() -> Self {
         let mut config = Self {
             signature_schemes: Vec::new(),
@@ -364,22 +395,26 @@ impl<'a> TlsConfig<'a> {
             alpn_protocols: None,
         };
 
-        if cfg!(feature = "alloc") {
+        #[cfg(feature = "rsa")]
+        {
             config = config.enable_rsa_signatures();
         }
 
+        #[cfg(feature = "p256")]
         unwrap!(
             config
                 .signature_schemes
                 .push(SignatureScheme::EcdsaSecp256r1Sha256)
                 .ok()
         );
+        #[cfg(feature = "p384")]
         unwrap!(
             config
                 .signature_schemes
                 .push(SignatureScheme::EcdsaSecp384r1Sha384)
                 .ok()
         );
+        #[cfg(feature = "ed25519")]
         unwrap!(config.signature_schemes.push(SignatureScheme::Ed25519).ok());
 
         #[cfg(not(feature = "x25519"))]
@@ -395,6 +430,7 @@ impl<'a> TlsConfig<'a> {
     }
 
     /// Enable RSA ciphers even if they might not be supported.
+    #[cfg(feature = "rsa")]
     pub fn enable_rsa_signatures(mut self) -> Self {
         unwrap!(
             self.signature_schemes
@@ -429,6 +465,10 @@ impl<'a> TlsConfig<'a> {
         self
     }
 
+    /// Sets the name the server's certificate must match, a DNS name or an IP address.
+    ///
+    /// It is sent as SNI, unless it is an IP address (RFC 6066, section 3). The verifiers refuse a
+    /// certificate without it.
     pub fn with_server_name(mut self, server_name: &'a str) -> Self {
         self.server_name = Some(server_name);
         self
@@ -473,6 +513,10 @@ impl<'a> TlsConfig<'a> {
         self
     }
 
+    /// Offer the pre-shared key `psk` under `identities`.
+    ///
+    /// A build without a signature feature needs one, because the server cannot authenticate
+    /// itself with a certificate.
     pub fn with_psk(mut self, psk: &'a [u8], identities: &[&'a [u8]]) -> Self {
         // TODO: Remove potential panic
         self.psk = Some((psk, unwrap!(Vec::from_slice(identities).ok())));
@@ -591,5 +635,29 @@ mod tests {
         let key = PrivateKey::External(&TooBig);
         let mut out = Vec::<u8, 128>::new();
         assert!(key.sign(b"hello", &mut out).is_err());
+    }
+
+    fn advertises(scheme: SignatureScheme) -> bool {
+        TlsConfig::new().signature_schemes.contains(&scheme)
+    }
+
+    #[test]
+    fn the_advertised_schemes_are_those_of_the_enabled_signature_features() {
+        assert_eq!(
+            advertises(SignatureScheme::EcdsaSecp256r1Sha256),
+            cfg!(feature = "p256")
+        );
+        assert_eq!(
+            advertises(SignatureScheme::EcdsaSecp384r1Sha384),
+            cfg!(feature = "p384")
+        );
+        assert_eq!(
+            advertises(SignatureScheme::Ed25519),
+            cfg!(feature = "ed25519")
+        );
+        assert_eq!(
+            advertises(SignatureScheme::RsaPssRsaeSha256),
+            cfg!(feature = "rsa")
+        );
     }
 }

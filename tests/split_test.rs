@@ -1,3 +1,6 @@
+// The test server's certificate is P-256, which the client offers only with `p256`.
+#![cfg(feature = "p256")]
+
 use embedded_io::{Read, Write};
 use embedded_io_adapters::std::FromStd;
 use std::net::{SocketAddr, TcpStream};
@@ -81,7 +84,7 @@ fn test_blocking_borrowed() {
         &mut write_record_buffer,
     );
 
-    tls.open(TlsContext::new(&config, NoVerify))
+    tls.open(TlsContext::new(&config, InsecureNoVerify))
         .expect("error establishing TLS connection");
 
     let (mut reader, mut writer) = tls.split();

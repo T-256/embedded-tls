@@ -132,24 +132,23 @@ where
     /// to be written to the connection.
     ///
     /// Returns the number of bytes buffered/written.
+    ///
+    /// Cancel-safe: a `write` future dropped before it completes does not consume any bytes.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, TlsError> {
         if self.is_opened() {
             if !self
                 .record_write_buf
                 .contains(ClientRecordHeader::ApplicationData)
+                || self.record_write_buf.is_full()
             {
                 self.flush().await?;
                 self.record_write_buf
                     .start_record(ClientRecordHeader::ApplicationData)?;
             }
 
-            let buffered = self.record_write_buf.append(buf);
-
-            if self.record_write_buf.is_full() {
-                self.flush().await?;
-            }
-
-            Ok(buffered)
+            // Nothing awaits after the append, so a dropped future has either consumed all of these
+            // bytes or none.
+            Ok(self.record_write_buf.append(buf))
         } else {
             Err(TlsError::MissingHandshake)
         }
@@ -157,21 +156,24 @@ where
 
     /// Force all previously written, buffered bytes to be encoded into a tls record and written
     /// to the connection.
+    ///
+    /// Cancel-safe: a `flush` future dropped part way through a record is completed by the next
+    /// `write` or `flush`.
     pub async fn flush(&mut self) -> Result<(), TlsError> {
         if !self.record_write_buf.is_empty() {
-            let key_schedule = self.key_schedule.write_state();
-            let slice = self.record_write_buf.close_record(key_schedule)?;
+            send_record(
+                &mut self.record_write_buf.reborrow_mut(),
+                self.key_schedule.write_state(),
+                &mut self.delegate,
+            )
+            .await?;
+        }
 
-            self.delegate
-                .write_all(slice)
-                .await
-                .map_err(|e| TlsError::Io(e.kind()))?;
-
-            key_schedule.increment_counter();
-
-            if self.flush_policy.flush_transport() {
-                self.flush_transport().await?;
-            }
+        // A `flush` cancelled during the transport flush left the transport unflushed. Flush it,
+        // whether or not this call sent a record.
+        if self.flush_policy.flush_transport() && self.record_write_buf.transport_unflushed() {
+            self.flush_transport().await?;
+            self.record_write_buf.transport_flushed();
         }
 
         Ok(())
@@ -498,19 +500,16 @@ where
             if !self
                 .record_write_buf
                 .contains(ClientRecordHeader::ApplicationData)
+                || self.record_write_buf.is_full()
             {
                 self.flush().await?;
                 self.record_write_buf
                     .start_record(ClientRecordHeader::ApplicationData)?;
             }
 
-            let buffered = self.record_write_buf.append(buf);
-
-            if self.record_write_buf.is_full() {
-                self.flush().await?;
-            }
-
-            Ok(buffered)
+            // Nothing awaits after the append, so a dropped future has either consumed all of these
+            // bytes or none.
+            Ok(self.record_write_buf.append(buf))
         } else {
             Err(TlsError::MissingHandshake)
         }
@@ -518,20 +517,51 @@ where
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
         if !self.record_write_buf.is_empty() {
-            let slice = self.record_write_buf.close_record(self.key_schedule)?;
+            send_record(
+                &mut self.record_write_buf,
+                self.key_schedule,
+                &mut self.delegate,
+            )
+            .await?;
+        }
 
-            self.delegate
-                .write_all(slice)
-                .await
-                .map_err(|e| TlsError::Io(e.kind()))?;
-
-            self.key_schedule.increment_counter();
-
-            if self.flush_policy.flush_transport() {
-                self.flush_transport().await?;
-            }
+        // A `flush` cancelled during the transport flush left the transport unflushed. Flush it,
+        // whether or not this call sent a record.
+        if self.flush_policy.flush_transport() && self.record_write_buf.transport_unflushed() {
+            self.flush_transport().await?;
+            self.record_write_buf.transport_flushed();
         }
 
         Ok(())
     }
+}
+
+/// Seals the open record, if there is one, and writes the sealed record to `delegate`.
+///
+/// The record counter advances as the record is sealed, before the first await, so a dropped
+/// future never encrypts two records under one nonce. A future dropped while writing leaves the
+/// unsent bytes in the buffer, and the next call writes them before anything else.
+async fn send_record<CipherSuite>(
+    record_write_buf: &mut WriteBufferBorrowMut<'_>,
+    key_schedule: &mut WriteKeySchedule<CipherSuite>,
+    delegate: &mut impl AsyncWrite,
+) -> Result<(), TlsError>
+where
+    CipherSuite: TlsCipherSuite,
+{
+    if record_write_buf.is_open() {
+        record_write_buf.seal_record(key_schedule)?;
+        key_schedule.increment_counter();
+    }
+    while !record_write_buf.unsent().is_empty() {
+        let written = delegate
+            .write(record_write_buf.unsent())
+            .await
+            .map_err(|e| TlsError::Io(e.kind()))?;
+        if written == 0 {
+            return Err(TlsError::Io(embedded_io::ErrorKind::WriteZero));
+        }
+        record_write_buf.mark_sent(written);
+    }
+    Ok(())
 }
